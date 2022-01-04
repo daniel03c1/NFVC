@@ -8,7 +8,7 @@ from embedding import Embedding
 
 def activation_mapper(activation):
     if activation in [None, '']:
-        return nn.Identity()
+        return nn.Identity
     elif isinstance(activation, str):
         return getattr(torch.nn, activation)
     elif callable(activation):
@@ -24,7 +24,7 @@ class NeuralFieldsNetwork(nn.Module):
                  hidden_features: int, n_hidden_layers: int,
                  input_embedding=None,
                  activation='ReLU',
-                 output_activation='Sigmoid',
+                 output_activation=None,
                  use_qat=False):
         super(NeuralFieldsNetwork, self).__init__()
  
