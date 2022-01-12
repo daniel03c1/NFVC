@@ -51,3 +51,27 @@ def apply_flow(prev_coords, flow, H=None, W=None, normalize=True):
                     / torch.tensor([[[[W-1, H-1]]]]).to(next_coords.device) - 1 
     return next_coords
 
+
+def bilinear_interpolation(images, coords):
+    '''
+    inputs
+        images(float): [N, C, H, W]
+        coords(float): [*, 3] (image_idx, x, y)
+    '''
+    xy = torch.floor(
+        torch.tensor([[0., 0.], [0., 1.], [1., 0.], [1., 1.]]) \
+        + coords[..., None, 1:])
+
+    xy = torch.clamp(xy,
+                     min=torch.tensor([0., 0.]),
+                     max=torch.tensor(images.size()[-1:-3:-1]).float() - 1)
+
+    # [*, 4, C] shaped values from images
+    values = images[coords[..., None, 0].long(), :,
+                    xy[..., 1].long(), xy[..., 0].long()]
+
+    weights = 1 - torch.abs(xy - coords[..., None, 1:])
+    weights = weights.prod(-1, keepdim=True)
+
+    return torch.sum(weights * values, -2)
+
