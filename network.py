@@ -29,12 +29,13 @@ class SmartActivation(nn.Module):
     def gumbel_softmax(self, logits, tau=1, eps=1e-10):
         noise = -torch.log(-torch.log(
             torch.rand(*logits.size()).clamp(min=eps)))
-        return F.softmax((logits + noise) / tau, -1)
+        return F.softmax((logits + noise.to(logits.device)) / tau, -1)
 
     def forward(self, inputs):
         if self.training:
             outputs = 0
             weights = self.gumbel_softmax(self.weights, self.tau)
+
             for i in range(self.n_acts):
                 outputs = outputs + weights[i]*self.activations[i](inputs)
             return outputs
