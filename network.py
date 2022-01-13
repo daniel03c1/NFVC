@@ -17,6 +17,30 @@ def activation_mapper(activation):
         raise ValueError()
 
 
+class SmartActivation(nn.Module):
+    def __init__(self, tau=1):
+        super(SmartActivation, self).__init__()
+        self.activations = [
+            nn.ReLU(), nn.GELU(), nn.Hardswish(), torch.sin]
+        self.n_acts = len(self.activations)
+        self.weights = nn.Parameter(torch.zeros(self.n_acts))
+        self.tau = tau
+
+    def gumbel_softmax(self, logits, tau=1, eps=1e-10):
+        noise = -torch.log(-torch.log(
+            torch.rand(*logits.size()).clamp(min=eps)))
+        return F.softmax((logits + noise) / tau, -1)
+
+    def forward(self, inputs):
+        if self.training:
+            outputs = 0
+            weights = self.gumbel_softmax(self.weights, self.tau)
+            for i in range(self.n_acts):
+                outputs = outputs + weights[i]*self.activations[i](inputs)
+            return outputs
+        return self.activations[torch.argmax(self.weights)](inputs)
+
+
 # TODO: update "use_qat" option
 class NeuralFieldsNetwork(nn.Module):
     def __init__(self,
