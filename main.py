@@ -10,7 +10,7 @@ from torch import optim
 from embedding import *
 from metrics import PSNR, SSIM, LPIPS, MSE
 from network import *
-from utils import load_video, make_input_grid, make_flow_grid, apply_flow
+from utils import *
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = True
@@ -39,12 +39,11 @@ parser.add_argument('--activation', default='ReLU', type=str,
 parser.add_argument('--sep_model', action='store_true')
 
 # Training
-parser.add_argument('--seed', type=int, default=50236, metavar='S',
+parser.add_argument('--seed', type=int, default=50236,
                     help='random seed (default: 50236)')
-parser.add_argument('--lr', type=float, default=0.001, metavar='N',
+parser.add_argument('--lr', type=float, default=0.001,
                     help='learning rate (default: 0.001)')
-parser.add_argument('--training-step', type=int, default=10000, metavar='N',
-                    help='the number of training iterations (default: 10000)')
+parser.add_argument('--epochs', type=int, default=10000)
 
 # custom parameters
 parser.add_argument('--scale', type=float, default=0.5,
@@ -62,9 +61,9 @@ def generate_indices(n_frames, keyframe_interval=None):
     if keyframe_interval is None:
         keyframe_interval = n_frames
     n_chunks = int(np.round(n_frames / float(keyframe_interval)))
-    chunk_indices = np.round(np.linspace(0, n_frames, n_chunks+1)).astype(int)
+    chunk_indices = torch.round(torch.linspace(0, n_frames, n_chunks+1)).long()
 
-    keyframe_indices = ((chunk_indices[:-1] + chunk_indices[1:])/2).astype(int)
+    keyframe_indices = ((chunk_indices[:-1] + chunk_indices[1:])/2).long()
 
     return keyframe_indices, chunk_indices
 
@@ -96,7 +95,7 @@ if __name__=='__main__':
     args = parser.parse_args()
     torch.manual_seed(args.seed)
 
-    metrics = [PSNR, SSIM(), LPIPS()]
+    metrics = [PSNR(), SSIM(), LPIPS()]
 
     '''     DATA     '''
     # 1. data loading
@@ -119,10 +118,11 @@ if __name__=='__main__':
         keyframe_nbyte = 0
     else:
         flow_grid = make_flow_grid(H, W)
-        keyframe_mapper = (np.arange(args.n_frames)[None, :]
+        keyframe_mapper = (torch.arange(args.n_frames)[None, :]
                            >= chunk_indices[:, None]).sum(0) - 1
         keyframes, keyframe_nbyte = extract_keyframes(
             target_frames, keyframe_indices, args.qf)
+        keyframes = keyframes.cuda()
 
     # 3. generate input_grid
     if not args.sep_model or len(keyframe_indices) == 1:
@@ -132,23 +132,20 @@ if __name__=='__main__':
         if args.in_features == 3 or n_keyframes == 1:
             args.in_features = 3
             input_grid = make_input_grid(len(target_frames), H, W)
-            grid_mapper = np.arange(args.n_frames)[:, None]
+            grid_mapper = torch.arange(args.n_frames)
         else: # args.in_features == 4
             input_grid = make_input_grid(
                 len(keyframe_indices), width, H, W)
             grid_mapper = np.stack(
                 [keyframe_mapper,
-                 np.arange(args.n_frames)-chunk_indices[keyframe_mapper]],
+                 torch.arange(args.n_frames)-chunk_indices[keyframe_mapper]],
                 -1)
-        model_mapper = np.zeros(args.n_frames)
     else:
         # multiple model
         args.sep_model = True
         input_grid = make_input_grid(width, H, W)
-        grid_mapper = (np.arange(args.n_frames)
-                       - chunk_indices[keyframe_mapper])[:, None]
-        model_mapper = (np.arange(args.n_frames)[None, :]
-                        >= chunk_indices[:, None]).sum(0) - 1
+        grid_mapper = (torch.arange(args.n_frames)
+                       - chunk_indices[keyframe_mapper])
 
     '''     MODEL     '''
     args.out_features = 3 + 2 * (not args.rgb_only)
@@ -161,11 +158,12 @@ if __name__=='__main__':
     ]
     nets = [nn.DataParallel(net.cuda()) for net in nets]
 
-    optimizer = optim.Adam(nets[0].parameters(), lr=args.lr, weight_decay=1e-5)
-    for net in nets[1:]:
-        optimizer.add_param_group(net.parameters())
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs)
+    optimizers = [
+        optim.Adam(nets[i].parameters(), lr=args.lr, weight_decay=1e-5)
+        for i in range(len(nets))]
+    schedulers = [
+        optim.lr_scheduler.CosineAnnealingLR(optimizers[i], T_max=args.epochs)
+        for i in range(len(nets))]
 
     '''     CONFIG & LOGS     '''
     dirname = "./result/{}_{}/".format(
@@ -184,99 +182,96 @@ if __name__=='__main__':
     print(f'n_params: {n_params}, approx size: {n_params*4 + keyframe_nbyte}')
 
     '''     TRAINING     '''
-    if args.batch_size is None:
-        args.batch_size = H * W
-    n_steps = (args.n_frames * H * W) // args.batch_size
+    batch_size = args.batch_size
+    if batch_size is None:
+        batch_size = H * W
+    n_steps = (args.n_frames * H * W) // batch_size
 
-    logs = np.zeros((args.epochs, len(metrics)+1))
+    logs = []
+
     with tqdm.tqdm(range(args.epochs)) as loop:
         for epoch in loop:
             for net in nets:
                 net.train()
 
             for i in range(n_steps):
-                j = torch.randint(args.n_frames, (batch_size,))
                 x = torch.randint(W, (batch_size,))
                 y = torch.randint(H, (batch_size,))
+                if not args.sep_model:
+                    n = 0
+                    j = torch.randint(args.n_frames, (batch_size,))
+                else: # args.sep_model:
+                    n = torch.randint(n_keyframes, ())
+                    j = torch.randint(chunk_indices[n], chunk_indices[n+1],
+                                      (batch_size,))
 
-                targets = None.cuda()
-                # preprocess inputs
-                # grid_mapper...
-                outputs = nets[n](inputs.cuda())
+                targets = target_frames[j, :, y, x].cuda()
+                inputs = input_grid[grid_mapper[j], y, x].cuda()
+                outputs = nets[n](inputs)
 
                 if args.rgb_only:
                     outputs = torch.sigmoid(outputs) # to RGB
-                    loss += F.mse_loss(outputs, targets)
                 else: # our approach
                     pred_flow, outputs = outputs[..., :2], outputs[..., 2:]
+                    outputs = torch.tanh(outputs)
 
-                    keyframe = targets_frames[keyframe_mapper[i]].unsqueeze(0).cuda()
-                    warped = F.grid_sample(
-                        keyframe, apply_flow(flow_grid, pred_flow, H, W),
-                        mode='bicubic', padding_mode='border',
-                        align_corners=True)
+                    warped = bilinear_interpolation(
+                        keyframes,
+                        torch.stack([keyframe_mapper[j].cuda(),
+                                     x.float().cuda() + pred_flow[..., 0],
+                                     y.float().cuda() + pred_flow[..., 1]],
+                                    -1))
                     outputs = (warped + outputs).clamp(0, 1)
 
                 loss = F.l1_loss(outputs, targets)
 
-                optimizer.zero_grad()
+                optimizers[n].zero_grad()
                 loss.backward()
-                optimizer.step()
+                optimizers[n].step()
 
-            scheduler.step()
+            for scheduler in schedulers:
+                scheduler.step()
 
             # logging
             if (epoch+1) % args.eval_interval == 0:
                 for net in nets:
                     net.eval()
 
+                epoch_log = np.zeros(len(metrics))
+
                 for i in range(args.n_frames):
+                    preds = net(input_grid[i].unsqueeze(0).cuda())
+                    true_rgb = target_frames[i].unsqueeze(0).cuda()
+
                     if args.rgb_only:
-                        pred_rgb = net(input_grid[i].unsqueeze(0).cuda())
-                        pred_rgb = torch.sigmoid(pred_rgb) # to RGB
+                        pred_rgb = torch.sigmoid(preds) # to RGB
                         pred_rgb = pred_rgb.permute(0, 3, 1, 2) # to [1, C, H, W]
-                        true_rgb = target_frames[i].unsqueeze(0).cuda()
                     else: # our approach
-                        inputs = input_grid
-                        for c in coord_mapper[i]:
-                            inputs = inputs[c]
-                        # pred_flow, residual = net(inputs.cuda())
-                        residual = net(inputs.cuda())
-                        pred_flow, residual = residual[..., :2], residual[..., 2:]
+                        pred_flow, residuals = preds[..., :2], preds[..., 2:]
                         residual = residual.permute(2, 0, 1) # to [3, H, W]
 
-                        keyframe = target_frames[keyframe_mapper[i]].unsqueeze(0).cuda()
 
-                        warped = F.grid_sample(
-                            keyframe, apply_flow(flow_grid, pred_flow, H, W),
-                            mode='bicubic', padding_mode='border',
-                            align_corners=True)
+                        warped = bilinear_interpolation(
+                            keyframes[keyframe_mapper[i]].unsqueeze(0).cuda(),
+                            torch.stack([keyframe_mapper[j].cuda(),
+                                         x.float().cuda() + pred_flow[..., 0],
+                                         y.float().cuda() + pred_flow[..., 1]],
+                                        -1))
+
                         pred_rgb = (warped + residual).clamp(0, 1)
-                        true_rgb = target_frames[i].unsqueeze(0).cuda()
 
                     for i in range(len(metrics)):
-                        test_metric_epoch[i] += metrics[i](pred_rgb, true_rgb).item()
+                        epoch_log[i] += \
+                            metrics[i](pred_rgb, true_rgb).item() / args.n_frames
 
                 for net in nets:
                     net.train()
 
-                metric_epoch = metric_epoch / args.n_frames
-                test_metric_epoch = test_metric_epoch / args.n_frames
-
-                postfix = {'PSNR': metric_epoch[0],
-                           'SSIM': metric_epoch[1],
-                           'LPIPS': metric_epoch[2],
-                           'tPSNR': test_metric_epoch[0],
-                           'tSSIM': test_metric_epoch[1],
-                           'tLPIPS': test_metric_epoch[2]}
-                loop.set_postfix(postfix)
+                loop.set_postfix({str(m): epoch_log[i]
+                                  for i, m in enumerate(metrics)})
+                logs.append(epoch_log)
 
                 # leave a log
-                metrics_list.append(metric_epoch+test_metric_epoch)
-                np.savetxt(dirname+"metrics.csv", metrics_list, delimiter=",")
-
-    model_path = os.path.join(dirname, f"model_final.pt")
-    torch.save({'epoch': epoch,
-                'model_state_dict': net.state_dict(),
-                'optimiaer_state_dict': optimizer.state_dict()}, model_path)
+                np.savetxt(os.path.join(dirname, "metrics.csv"),
+                           logs, delimiter=",")
 

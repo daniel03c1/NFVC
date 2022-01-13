@@ -2,7 +2,7 @@ import numpy as np
 import os
 import skvideo.io
 import torch
-import torchvision.transforms.functional as F
+import torchvision
 
 
 def load_video(name, scale=1, start_frame=0, num_frames=None):
@@ -18,7 +18,7 @@ def load_video(name, scale=1, start_frame=0, num_frames=None):
     frames = frames.permute(0, 3, 1, 2) # to [time, chan, height, width]
 
     if scale != 1:
-        frames = F.resize(
+        frames = torchvision.transforms.functional.resize(
             frames,
             tuple(int(s*scale) for s in frames.size()[-2:]), # new video size
             antialias=True)
@@ -59,12 +59,13 @@ def bilinear_interpolation(images, coords):
         coords(float): [*, 3] (image_idx, x, y)
     '''
     xy = torch.floor(
-        torch.tensor([[0., 0.], [0., 1.], [1., 0.], [1., 1.]]) \
+        torch.tensor([[0., 0.], [0, 1], [1, 0], [1, 1]]).to(coords.device) \
         + coords[..., None, 1:])
 
-    xy = torch.clamp(xy,
-                     min=torch.tensor([0., 0.]),
-                     max=torch.tensor(images.size()[-1:-3:-1]).float() - 1)
+    xy = torch.clamp(
+        xy,
+        min=torch.tensor([0., 0.]).to(xy.device),
+        max=torch.tensor(images.size()[-1:-3:-1]).float().to(xy.device) - 1)
 
     # [*, 4, C] shaped values from images
     values = images[coords[..., None, 0].long(), :,
