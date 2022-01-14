@@ -43,7 +43,7 @@ parser.add_argument('--seed', type=int, default=50236,
                     help='random seed (default: 50236)')
 parser.add_argument('--lr', type=float, default=0.001,
                     help='learning rate (default: 0.001)')
-parser.add_argument('--epochs', type=int, default=10000)
+parser.add_argument('--epochs', type=int, default=5000)
 
 # custom parameters
 parser.add_argument('--scale', type=float, default=0.5,
@@ -113,13 +113,13 @@ if __name__=='__main__':
         generate_indices(args.n_frames, args.keyframe_interval)
     n_keyframes = len(keyframe_indices)
     width = max(chunk_indices[1:]-chunk_indices[:-1])
+    chunk_mapper = (torch.arange(args.n_frames)[None, :]
+                    >= chunk_indices[:, None]).sum(0) - 1
 
     if args.rgb_only:
         keyframe_nbyte = 0
     else:
         flow_grid = make_flow_grid(H, W)
-        keyframe_mapper = (torch.arange(args.n_frames)[None, :]
-                           >= chunk_indices[:, None]).sum(0) - 1
         keyframes, keyframe_nbyte = extract_keyframes(
             target_frames, keyframe_indices, args.qf)
         keyframes = keyframes.cuda()
@@ -137,15 +137,15 @@ if __name__=='__main__':
             input_grid = make_input_grid(
                 len(keyframe_indices), width, H, W)
             grid_mapper = np.stack(
-                [keyframe_mapper,
-                 torch.arange(args.n_frames)-chunk_indices[keyframe_mapper]],
+                [chunk_mapper,
+                 torch.arange(args.n_frames)-chunk_indices[chunk_mapper]],
                 -1)
     else:
         # multiple model
         args.sep_model = True
         input_grid = make_input_grid(width, H, W)
         grid_mapper = (torch.arange(args.n_frames)
-                       - chunk_indices[keyframe_mapper])
+                       - chunk_indices[chunk_mapper])
 
     '''     MODEL     '''
     args.out_features = 3 + 2 * (not args.rgb_only)
@@ -153,7 +153,9 @@ if __name__=='__main__':
     nets = [
         NeuralFieldsNetwork(args.in_features, args.out_features,
                             args.hidden_features, args.n_hidden_layers,
-                            RFF(args.in_features, args.emb_size//2, np.pi))
+                            RFF(args.in_features, args.emb_size//2, np.pi),
+                            activation=SmartActivation)
+                            # activation='ReLU')
         for i in range(1 + args.sep_model * (n_keyframes-1))
     ]
     nets = [nn.DataParallel(net.cuda()) for net in nets]
@@ -187,43 +189,34 @@ if __name__=='__main__':
         batch_size = H * W
     n_steps = (args.n_frames * H * W) // batch_size
 
+    for net in nets:
+        net.train()
     logs = []
 
     with tqdm.tqdm(range(args.epochs)) as loop:
         for epoch in loop:
-            for net in nets:
-                net.train()
-
             for i in range(n_steps):
-                x = torch.randint(W, (batch_size,))
-                y = torch.randint(H, (batch_size,))
-                if not args.sep_model:
-                    n = 0
-                    j = torch.randint(args.n_frames, (batch_size,))
-                else: # args.sep_model:
-                    n = torch.randint(n_keyframes, ())
-                    j = torch.randint(chunk_indices[n], chunk_indices[n+1],
-                                      (batch_size,))
-
-                targets = target_frames[j, :, y, x].cuda()
-                inputs = input_grid[grid_mapper[j], y, x].cuda()
-                outputs = nets[n](inputs)
+                n = chunk_mapper[i]
+                true_rgb = target_frames[i].unsqueeze(0).cuda()
+                outputs = nets[n](input_grid[i].unsqueeze(0).cuda())
 
                 if args.rgb_only:
-                    outputs = torch.sigmoid(outputs) # to RGB
+                    pred_rgb = torch.sigmoid(outputs) # to RGB
+                    pred_rgb = pred_rgb.permute(0, 3, 1, 2) # to [1, C, H, W]
                 else: # our approach
                     pred_flow, outputs = outputs[..., :2], outputs[..., 2:]
                     outputs = torch.tanh(outputs)
+                    outputs = outputs.permute(0, 3, 1, 2)
 
-                    warped = bilinear_interpolation(
-                        keyframes,
-                        torch.stack([keyframe_mapper[j].cuda(),
-                                     x.float().cuda() + pred_flow[..., 0],
-                                     y.float().cuda() + pred_flow[..., 1]],
-                                    -1))
-                    outputs = (warped + outputs).clamp(0, 1)
+                    keyframe = keyframes[n].unsqueeze(0).cuda()
 
-                loss = F.l1_loss(outputs, targets)
+                    warped = F.grid_sample(
+                        keyframe, apply_flow(flow_grid, pred_flow, H, W),
+                        mode='bilinear', padding_mode='border',
+                        align_corners=True)
+                    pred_rgb = (warped + outputs).clamp(0, 1)
+
+                loss = F.l1_loss(pred_rgb, true_rgb)
 
                 optimizers[n].zero_grad()
                 loss.backward()
@@ -240,26 +233,26 @@ if __name__=='__main__':
                 epoch_log = np.zeros(len(metrics))
 
                 for i in range(args.n_frames):
-                    preds = net(input_grid[i].unsqueeze(0).cuda())
+                    n = chunk_mapper[i]
                     true_rgb = target_frames[i].unsqueeze(0).cuda()
+                    outputs = nets[n](input_grid[i].unsqueeze(0).cuda())
 
                     if args.rgb_only:
-                        pred_rgb = torch.sigmoid(preds) # to RGB
+                        pred_rgb = torch.sigmoid(outputs) # to RGB
                         pred_rgb = pred_rgb.permute(0, 3, 1, 2) # to [1, C, H, W]
                     else: # our approach
-                        pred_flow, residuals = preds[..., :2], preds[..., 2:]
-                        residual = residual.permute(2, 0, 1) # to [3, H, W]
+                        pred_flow, outputs = outputs[..., :2], outputs[..., 2:]
+                        outputs = torch.tanh(outputs)
+                        outputs = outputs.permute(0, 3, 1, 2)
 
+                        keyframe = keyframes[n].unsqueeze(0).cuda()
 
-                        warped = bilinear_interpolation(
-                            keyframes[keyframe_mapper[i]].unsqueeze(0).cuda(),
-                            torch.stack([keyframe_mapper[j].cuda(),
-                                         x.float().cuda() + pred_flow[..., 0],
-                                         y.float().cuda() + pred_flow[..., 1]],
-                                        -1))
-
-                        pred_rgb = (warped + residual).clamp(0, 1)
-
+                        warped = F.grid_sample(
+                            keyframe, apply_flow(flow_grid, pred_flow, H, W),
+                            mode='bilinear', padding_mode='border',
+                            align_corners=True)
+                        pred_rgb = (warped + outputs).clamp(0, 1)
+ 
                     for i in range(len(metrics)):
                         epoch_log[i] += \
                             metrics[i](pred_rgb, true_rgb).item() / args.n_frames
@@ -274,4 +267,6 @@ if __name__=='__main__':
                 # leave a log
                 np.savetxt(os.path.join(dirname, "metrics.csv"),
                            logs, delimiter=",")
+
+    print('finished')
 
