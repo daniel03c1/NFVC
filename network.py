@@ -17,29 +17,13 @@ def activation_mapper(activation):
         raise ValueError()
 
 
-class SmartActivation(nn.Module):
-    def __init__(self, tau=1):
-        super(SmartActivation, self).__init__()
-        self.activations = [
-            nn.ReLU(), nn.GELU(), nn.Hardswish(), torch.sin]
-        self.n_acts = len(self.activations)
-        self.weights = nn.Parameter(torch.zeros(self.n_acts))
-        self.tau = tau
-
-    def gumbel_softmax(self, logits, tau=1, eps=1e-10):
-        noise = -torch.log(-torch.log(
-            torch.rand(*logits.size()).clamp(min=eps)))
-        return F.softmax((logits + noise.to(logits.device)) / tau, -1)
+class Swish(nn.Module):
+    def __init__(self):
+        super(Swish, self).__init__()
+        self.beta = nn.Parameter(torch.ones(()))
 
     def forward(self, inputs):
-        if self.training:
-            outputs = 0
-            weights = self.gumbel_softmax(self.weights, self.tau)
-
-            for i in range(self.n_acts):
-                outputs = outputs + weights[i]*self.activations[i](inputs)
-            return outputs
-        return self.activations[torch.argmax(self.weights)](inputs)
+        return inputs * torch.sigmoid(inputs * self.beta)
 
 
 # TODO: update "use_qat" option
@@ -63,7 +47,8 @@ class NeuralFieldsNetwork(nn.Module):
 
         self.nets = []
 
-        if input_embedding is not None:
+        self.use_embedding = input_embedding is not None
+        if self.use_embedding:
             assert isinstance(input_embedding, Embedding)
             self.nets.extend([
                 input_embedding,
@@ -84,8 +69,15 @@ class NeuralFieldsNetwork(nn.Module):
             nn.Linear(hidden_features, out_features),
             output_activation()])
 
-        self.nets = nn.Sequential(*self.nets)
+        self.nets = nn.ModuleList(self.nets)
 
     def forward(self, inputs):
-        return self.nets(inputs)
+        outputs = inputs
+        if self.use_embedding:
+            outputs = self.nets[0](outputs)
+
+        for i, net in enumerate(self.nets[self.use_embedding:]):
+            outputs = net(outputs)
+
+        return outputs
 

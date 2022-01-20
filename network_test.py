@@ -14,22 +14,14 @@ class NetworkTest(unittest.TestCase):
         self.assertEqual(network(torch.ones([32, in_features])).size(),
                          (32, out_features))
 
-    def test_smart_activation(self):
+    def test_swish(self):
         in_features, out_features = 3, 5
-        inputs = torch.rand(32, in_features)
-
         network = nn.Sequential(
             nn.Linear(in_features, out_features),
-            SmartActivation(),
-            nn.Linear(out_features, out_features))
+            Swish())
 
-        network.train()
-        outputs = network(inputs)
-        self.assertEqual(outputs.size(), (32, out_features))
-
-        # test evaluation mode
-        network.eval()
-        self.assertTrue((outputs - network(inputs)).abs().sum() > 1e-5)
+        inputs = torch.rand(32, in_features)
+        self.assertEqual(network(inputs).size(), (32, out_features))
 
 
 if __name__ == '__main__':
